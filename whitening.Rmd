@@ -1,0 +1,195 @@
+---
+title: "Experiments with whitening"
+output: html_notebook
+---
+
+
+```{r message=FALSE}
+library(tidyverse)
+library(magrittr)
+library(glue)
+library(cytominergallery)
+```
+
+```{r message=FALSE}
+profiles <-
+  readr::read_csv(system.file("extdata", "ljosa_jbiomolscreen_2013_per_well_mean.csv",
+                package = "cytominergallery"))
+
+moa <-
+  readr::read_csv(system.file("extdata", "BBBC021_v1_moa.csv",
+                              package = "cytominergallery")) %>%
+  rename(Image_Metadata_Compound = compound,
+                Image_Metadata_Concentration = concentration,
+                Image_Metadata_MoA = moa
+  )
+
+metadata <-
+  readr::read_csv(system.file("extdata", "BBBC021_v1_image.csv",
+                              package = "cytominergallery")) %>%
+  rename(Image_Metadata_Plate = Image_Metadata_Plate_DAPI,
+                Image_Metadata_Well = Image_Metadata_Well_DAPI
+  ) %>%
+  select(matches("^Image_Metadata")) %>%
+  inner_join(moa) %>%
+  distinct()
+
+profiles %<>%
+  inner_join(metadata)
+
+profiles %<>%
+  separate(col = Image_Metadata_Plate, into = c("Image_Metadata_Batch", "Image_Metadata_Plate"), remove = TRUE)
+
+variables <-
+  colnames(profiles) %>%
+  str_subset("^Nuclei_|^Cells_|^Cytoplasm_")
+```
+
+```{r echo=TRUE}
+
+futile.logger::flog.threshold(futile.logger::ERROR)
+
+variables <-
+  colnames(profiles) %>%
+  str_subset("^Nuclei_|^Cells_|^Cytoplasm_")
+
+profiles %<>% 
+  cytominer::variable_select(
+  variables = variables,
+  sample = profiles %>% filter(Image_Metadata_Compound == "DMSO"),
+  operation = "variance_threshold"
+  )
+
+profiles %<>% na.omit()
+
+variables <-
+  colnames(profiles) %>%
+  str_subset("^Nuclei_|^Cells_|^Cytoplasm_")
+
+profiles %<>% 
+  cytominer::variable_select(
+  variables = variables,
+  sample = profiles,
+  operation = "correlation_threshold"
+  )
+
+```
+
+```{r}
+strata <- "Image_Metadata_Batch"
+
+whiten_global_alpha_neg_log_10 <- 8
+
+whiten_global_alpha <- 10**(-whiten_global_alpha_neg_log_10)
+
+whiten_batch_alpha <- 1
+
+profiles_global_whitened <-
+  profiles %>%
+  cytominer::whiten(colnames(profiles) %>%  str_subset("^Nuclei_|^Cells_|^Cytoplasm_"), 
+                    profiles %>% filter(Image_Metadata_Compound == "DMSO"), 
+                    whiten_global_alpha)
+
+population <- profiles_global_whitened
+
+sample <- profiles_global_whitened %>% 
+  filter(Image_Metadata_Compound == "DMSO")
+
+variables <-
+  colnames(profiles_global_whitened) %>%
+  str_subset("^PC")
+
+groups <-
+  profiles_global_whitened %>%
+  dplyr::select_(.dots = strata) %>%
+  dplyr::distinct() %>%
+  dplyr::collect()
+
+profiles_batch_whitened <-
+  
+  Reduce(dplyr::union_all,
+         Map(
+           f = function(group) {
+             stratum <-
+               sample %>%
+               dplyr::inner_join(y = group,
+                                 by = names(group),
+                                 copy = TRUE)
+             
+             population %>%
+               dplyr::inner_join(y = group, by = names(group), copy = TRUE)
+             
+             whitened <-
+               population %>%
+               dplyr::inner_join(y = group,
+                                 by = names(group),
+                                 copy = TRUE) %>%
+               cytominer::whiten(variables, stratum, whiten_batch_alpha)
+             
+             whitened
+           },
+           split(x = groups, f = seq(nrow(groups)))
+         ))
+
+spectral_stats <- 
+  profiles_batch_whitened %>%
+  filter(Image_Metadata_Compound == "DMSO") %>%
+  group_by(Image_Metadata_Batch) %>%
+  nest() %>%
+  mutate(sumcolmean = map(data, function(df) sum(colMeans(df %>% select(matches("^PC")) %>% as.matrix())))) %>% 
+  mutate(covtrace = map(data, function(df) sum(diag(cov(df %>% select(matches("^PC")) %>% as.matrix()))))) %>% 
+  select(-data) %>% 
+  unnest(sumcolmean, covtrace)
+
+# ggplot(spectral_stats %>%
+#          select(sumcolmean) %>%
+#          gather(stat, value),
+#        aes(abs(value))) + 
+#          scale_x_log10() +
+#          geom_histogram(binwidth = .05) + 
+#   ggtitle("Is the whitened data zero-centered?", subtitle = "The sum of the column means should be nearly zero.")
+
+get_eigen <- function(profiles) {
+  cov(
+    profiles %>%
+      filter(Image_Metadata_Compound == "DMSO") %>%
+      select(matches("^PC")) %>%
+      as.matrix()
+  ) %>%
+    diag() %>%
+    t() %>%
+    as.data.frame() %>%
+    gather(eigen, value) %>%
+    mutate(eigen = str_replace(eigen, "PC", "")) %>%
+    mutate(eigen = as.integer(eigen)) 
+}
+
+eigenvalues <- 
+  profiles_batch_whitened %>%
+  group_by(Image_Metadata_Batch) %>%
+  nest() %>%
+  mutate(eigenvalues = map(data, get_eigen)) %>%
+  ungroup() %>%
+  unnest(eigenvalues)
+
+p <- 
+  ggplot(eigenvalues, 
+       aes(eigen, value)) + 
+  geom_line(alpha = 0.5) + 
+  geom_vline(data = 
+               profiles %>%
+               filter(Image_Metadata_Compound == "DMSO") %>%
+               group_by(Image_Metadata_Batch) %>%
+               tally(), 
+             aes(xintercept = n), color = "red", alpha = 0.5) +
+  facet_wrap(~Image_Metadata_Batch, ncol = 2) +
+  xlab("eigenvalue #") +
+  ggtitle("Spectrum of DMSO wells of each batch of BBBC021, after whitening", 
+          subtitle = glue("Global alpha = {whiten_global_alpha}. Batch alpha = {whiten_batch_alpha}. Red line = no. of DMSOs, which determines rank."))
+
+p
+
+ggsave(glue("spectrum_{whiten_global_alpha_neg_log_10}.png"), p, width = 8, height = 10) 
+
+```
+
