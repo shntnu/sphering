@@ -1,0 +1,2 @@
+# whitening
+Experiments with whitening 
