@@ -113,7 +113,7 @@ Whiten the entire dataset using DMSO distribution as a reference
 ```{r}
 # specify regularization parameter for whitening transformation
 
-whiten_global_alpha_neg_log_10 <- 9
+whiten_global_alpha_neg_log_10 <- 1
 
 whiten_global_alpha <- 10**(-whiten_global_alpha_neg_log_10)
 
@@ -131,7 +131,7 @@ variance_global <-  get_variance(profiles_global_whitened)
 ```
 
 Estimate variance of each dimension of whitened data as:
-$$\hat{\alpha_i} = \frac{1}{\alpha_i + \epsilon}$$ 
+$$\hat{\sigma_i} = \frac{\sigma_i}{\sigma_i + \epsilon}$$ 
 
 ```{r}
 estimated_whitened_variance <-
