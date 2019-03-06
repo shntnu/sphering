@@ -1,5 +1,7 @@
 # Experiments with whitening 
 
+(see http://rpubs.com/shantanu/whitening for math rendering)
+
 The regularization parameter $\epsilon$ (here, varied from $1$ to $10^{-9}$) determines the shape of the curve below, 
 which shows the eigenvalues of the whitened covariance matrix: 
 
