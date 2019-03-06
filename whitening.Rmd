@@ -11,6 +11,8 @@ library(glue)
 library(cytominergallery)
 ```
 
+Load the BBBC021 dataset
+
 ```{r message=FALSE}
 profiles <-
   readr::read_csv(system.file("extdata", "ljosa_jbiomolscreen_2013_per_well_mean.csv",
@@ -45,6 +47,9 @@ variables <-
   str_subset("^Nuclei_|^Cells_|^Cytoplasm_")
 ```
 
+Select variables based on variable thresholding (remove near-zero variance variables) and 
+correlation thresholding (select a subset of variables that are not highly correlated)
+
 ```{r echo=TRUE}
 
 futile.logger::flog.threshold(futile.logger::ERROR)
@@ -73,22 +78,125 @@ profiles %<>%
   operation = "correlation_threshold"
   )
 
+variables <-
+  colnames(profiles) %>%
+  str_subset("^Nuclei_|^Cells_|^Cytoplasm_")
+
+n_variables_original <-  length(variables)
+
 ```
 
-```{r}
-strata <- "Image_Metadata_Batch"
+Define function to get variance of whitened data matrix
 
-whiten_global_alpha_neg_log_10 <- 8
+```{r}
+get_variance <- function(profiles) {
+  cov(
+    profiles %>%
+      filter(Image_Metadata_Compound == "DMSO") %>%
+      select(matches("^PC")) %>%
+      as.matrix()
+  ) %>%
+    diag() %>%
+    t() %>%
+    as.data.frame() %>%
+    gather(dimension, value) %>%
+    mutate(dimension = str_replace(dimension, "PC", "")) %>%
+    mutate(dimension = as.integer(dimension)) 
+}
+
+
+```
+
+
+Whiten the entire dataset using DMSO distribution as a reference
+
+```{r}
+# specify regularization parameter for whitening transformation
+
+whiten_global_alpha_neg_log_10 <- 9
 
 whiten_global_alpha <- 10**(-whiten_global_alpha_neg_log_10)
-
-whiten_batch_alpha <- 1
 
 profiles_global_whitened <-
   profiles %>%
   cytominer::whiten(colnames(profiles) %>%  str_subset("^Nuclei_|^Cells_|^Cytoplasm_"), 
                     profiles %>% filter(Image_Metadata_Compound == "DMSO"), 
                     whiten_global_alpha)
+```
+
+Calculate variance of each dimension of whitened data
+
+```{r}
+variance_global <-  get_variance(profiles_global_whitened)
+```
+
+Estimate variance of each dimension of whitened data as:
+$$\hat{\alpha_i} = \frac{1}{\alpha_i + \epsilon}$$ 
+
+```{r}
+estimated_whitened_variance <-
+  profiles %>% 
+  filter(Image_Metadata_Compound == "DMSO") %>%
+  select(matches("^Nuclei_|^Cells_|^Cytoplasm_")) %>%
+  as.matrix() %>%
+  cov() %>% 
+  eigen(only.values = TRUE) %>%
+  extract("values") %>%
+  as.data.frame() %>%
+  rename(variance = values) %>%
+  mutate(dimension = 1:n()) %>%
+  mutate(estimated_whitened_variance = variance / (variance + whiten_global_alpha)) %>%
+  select(dimension, estimated_whitened_variance)
+```
+
+Are the estimated and real variances the same?
+
+```{r}
+inner_join(estimated_whitened_variance,
+           variance_global, by = c("dimension")) %>%
+  ggplot(aes(value, estimated_whitened_variance)) + 
+  geom_point() + 
+  geom_abline(slope = 1) +
+  xlim(c(0, 1)) + 
+  ylim(c(0, 1)) + 
+  coord_equal()
+```
+
+Plot the variances of each dimension of the whitened data. 
+
+```{r  fig.width=8, fig.height=4}
+n_dmso <-
+  profiles_global_whitened %>%
+  filter(Image_Metadata_Compound == "DMSO") %>% 
+  nrow()
+
+p <- 
+  ggplot(variance_global, 
+       aes(dimension, value)) + 
+  geom_line(alpha = 0.5) + 
+  geom_vline(aes(xintercept = n_dmso), color = "red", alpha = 0.5) +
+  geom_vline(aes(xintercept = n_variables_original), color = "blue", alpha = 0.5) +
+  ylim(c(0, 1)) +
+  xlab("dimension #") +
+  ggtitle("Variance of DMSO wells of BBBC021, after whitening", 
+          subtitle = glue("-log 10 Global alpha = {whiten_global_alpha_neg_log_10}. Red line = no. of DMSOs. Blue line = dims. of feature space."))
+
+p
+
+ggsave(glue("variance_{whiten_global_alpha_neg_log_10}.png"), p, width = 8, height = 4) 
+
+```
+
+Perform batch-wise whitening
+Calculate variance of each dimension of whitened data, per batch
+Plot the variances of each dimension of the whitened data, per batch
+
+```{r, fig.width=8, fig.height=10}
+strata <- "Image_Metadata_Batch"
+
+whiten_batch_alpha_neg_log_10 <- 1
+
+whiten_batch_alpha <- 10**(-whiten_batch_alpha_neg_log_10)
 
 population <- profiles_global_whitened
 
@@ -131,50 +239,21 @@ profiles_batch_whitened <-
            split(x = groups, f = seq(nrow(groups)))
          ))
 
-spectral_stats <- 
-  profiles_batch_whitened %>%
-  filter(Image_Metadata_Compound == "DMSO") %>%
-  group_by(Image_Metadata_Batch) %>%
-  nest() %>%
-  mutate(sumcolmean = map(data, function(df) sum(colMeans(df %>% select(matches("^PC")) %>% as.matrix())))) %>% 
-  mutate(covtrace = map(data, function(df) sum(diag(cov(df %>% select(matches("^PC")) %>% as.matrix()))))) %>% 
-  select(-data) %>% 
-  unnest(sumcolmean, covtrace)
+# Calculate variance of each dimension of whitened data, per batch
 
-# ggplot(spectral_stats %>%
-#          select(sumcolmean) %>%
-#          gather(stat, value),
-#        aes(abs(value))) + 
-#          scale_x_log10() +
-#          geom_histogram(binwidth = .05) + 
-#   ggtitle("Is the whitened data zero-centered?", subtitle = "The sum of the column means should be nearly zero.")
-
-get_eigen <- function(profiles) {
-  cov(
-    profiles %>%
-      filter(Image_Metadata_Compound == "DMSO") %>%
-      select(matches("^PC")) %>%
-      as.matrix()
-  ) %>%
-    diag() %>%
-    t() %>%
-    as.data.frame() %>%
-    gather(eigen, value) %>%
-    mutate(eigen = str_replace(eigen, "PC", "")) %>%
-    mutate(eigen = as.integer(eigen)) 
-}
-
-eigenvalues <- 
+variance <- 
   profiles_batch_whitened %>%
   group_by(Image_Metadata_Batch) %>%
   nest() %>%
-  mutate(eigenvalues = map(data, get_eigen)) %>%
+  mutate(variances = map(data, get_variance)) %>%
   ungroup() %>%
-  unnest(eigenvalues)
+  unnest(variances)
+
+# Plot the variances of each dimension of the whitened data, per batch
 
 p <- 
-  ggplot(eigenvalues, 
-       aes(eigen, value)) + 
+  ggplot(variance, 
+       aes(dimension, value)) + 
   geom_line(alpha = 0.5) + 
   geom_vline(data = 
                profiles %>%
@@ -182,14 +261,21 @@ p <-
                group_by(Image_Metadata_Batch) %>%
                tally(), 
              aes(xintercept = n), color = "red", alpha = 0.5) +
+  geom_vline(aes(xintercept = length(variables_original)), color = "blue", alpha = 0.5) +
   facet_wrap(~Image_Metadata_Batch, ncol = 2) +
-  xlab("eigenvalue #") +
-  ggtitle("Spectrum of DMSO wells of each batch of BBBC021, after whitening", 
-          subtitle = glue("Global alpha = {whiten_global_alpha}. Batch alpha = {whiten_batch_alpha}. Red line = no. of DMSOs, which determines rank."))
+  xlab("dimension #") +
+  ggtitle("Variance of DMSO wells of each batch of BBBC021, after whitening", 
+          subtitle = 
+            glue("-log10 Global alpha = {whiten_global_alpha_neg_log_10}. -log10 Batch alpha = {whiten_batch_alpha_neg_log_10}. Red line = no. of DMSOs, which determines rank."))
 
 p
 
-ggsave(glue("spectrum_{whiten_global_alpha_neg_log_10}.png"), p, width = 8, height = 10) 
+ggsave(glue("variance_{whiten_global_alpha_neg_log_10}_{whiten_batch_alpha_neg_log_10}.png"), 
+       p, width = 8, height = 10) 
 
 ```
 
+In all, 
+- whitening makes sense when the covariance matrix is full rank, but should not be used otherwise. 
+- we almost never have enough DMSOs to do whitening per batch, given the dimensionality of the feature space.
+- regularization can't help with fixing the problem of rank deficiency
